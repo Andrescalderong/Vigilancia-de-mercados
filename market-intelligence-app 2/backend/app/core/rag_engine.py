@@ -10,7 +10,6 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
-import json
 
 # Vector store
 import chromadb
@@ -23,9 +22,24 @@ from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 
-from ..core.config import get_settings, Constants
+# LLMs
+import google.generativeai as genai
+
+from ..core.config import get_settings
 
 logger = logging.getLogger("market_intelligence.rag")
+
+
+# ---------------------------------------------------------------------------
+# Constantes de verificación
+# ---------------------------------------------------------------------------
+
+VERIFICATION_STATUS = {
+    "VERIFIED": "verified",
+    "PENDING": "pending_additional_sources",
+    "CROSS_CHECKING": "cross_checking",
+    "FAILED": "verification_failed",
+}
 
 
 @dataclass
@@ -64,12 +78,16 @@ class GenerationResult:
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
 
+# ---------------------------------------------------------------------------
+# Embedding Engine
+# ---------------------------------------------------------------------------
+
 class EmbeddingEngine:
     """Motor de embeddings usando Sentence Transformers."""
     
     def __init__(self, model_name: str = None):
         settings = get_settings()
-        self.model_name = model_name or settings.EMBEDDING_MODEL
+        self.model_name = model_name or settings.embedding_model
         self.model = None
         self._load_model()
     
@@ -97,6 +115,10 @@ class EmbeddingEngine:
         return float(cosine_similarity(emb1, emb2)[0][0])
 
 
+# ---------------------------------------------------------------------------
+# Vector Store
+# ---------------------------------------------------------------------------
+
 class VectorStore:
     """Almacén vectorial usando ChromaDB."""
     
@@ -114,13 +136,13 @@ class VectorStore:
         
         self.client = chromadb.Client(ChromaSettings(
             chroma_db_impl="duckdb+parquet",
-            persist_directory=self.settings.CHROMA_PERSIST_DIRECTORY,
-            anonymized_telemetry=False
+            persist_directory=self.settings.chroma_persist_dir,
+            anonymized_telemetry=False,
         ))
         
         self.collection = self.client.get_or_create_collection(
-            name=self.settings.CHROMA_COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"}
+            name=self.settings.chroma_collection_name,
+            metadata={"hnsw:space": "cosine"},
         )
         
         logger.info(f"Vector store initialized with {self.collection.count()} documents")
@@ -128,7 +150,7 @@ class VectorStore:
     def add_documents(
         self, 
         documents: List[Document],
-        source_info: Dict[str, Any] = None
+        source_info: Dict[str, Any] = None,
     ) -> int:
         """Añade documentos al vector store."""
         if not documents:
@@ -150,7 +172,7 @@ class VectorStore:
                 "source": doc.metadata.get("source", "unknown"),
                 "source_type": source_info.get("type", "primary") if source_info else "primary",
                 "indexed_at": datetime.utcnow().isoformat(),
-                **doc.metadata
+                **doc.metadata,
             }
             metadatas.append(metadata)
         
@@ -158,7 +180,7 @@ class VectorStore:
             documents=texts,
             embeddings=embeddings,
             ids=ids,
-            metadatas=metadatas
+            metadatas=metadatas,
         )
         
         logger.info(f"Added {len(documents)} documents to vector store")
@@ -168,33 +190,33 @@ class VectorStore:
         self, 
         query: str, 
         top_k: int = None,
-        filter_criteria: Dict[str, Any] = None
+        filter_criteria: Dict[str, Any] = None,
     ) -> Tuple[List[Document], List[float]]:
         """Búsqueda semántica en el vector store."""
-        settings = get_settings()
-        top_k = top_k or settings.RAG_TOP_K
+        settings = self.settings
+        top_k = top_k or settings.rag_top_k
         
         query_embedding = self.embedding_engine.embed_text(query)
         
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
-            where=filter_criteria
+            where=filter_criteria,
         )
         
         documents = []
         scores = []
         
-        if results and results['documents']:
-            for i, doc_text in enumerate(results['documents'][0]):
-                metadata = results['metadatas'][0][i] if results['metadatas'] else {}
+        if results and results.get("documents"):
+            for i, doc_text in enumerate(results["documents"][0]):
+                metadata = results["metadatas"][0][i] if results.get("metadatas") else {}
                 documents.append(Document(
                     page_content=doc_text,
-                    metadata=metadata
+                    metadata=metadata,
                 ))
                 
                 # ChromaDB retorna distancias, convertir a similitud
-                distance = results['distances'][0][i] if results['distances'] else 0
+                distance = results["distances"][0][i] if results.get("distances") else 0
                 similarity = 1 - distance  # Convertir distancia coseno a similitud
                 scores.append(similarity)
         
@@ -202,16 +224,19 @@ class VectorStore:
     
     def delete_by_source(self, source_name: str) -> int:
         """Elimina documentos por fuente."""
-        # Obtener IDs de documentos con esa fuente
         results = self.collection.get(
-            where={"source": source_name}
+            where={"source": source_name},
         )
         
-        if results and results['ids']:
-            self.collection.delete(ids=results['ids'])
-            return len(results['ids'])
+        if results and results.get("ids"):
+            self.collection.delete(ids=results["ids"])
+            return len(results["ids"])
         return 0
 
+
+# ---------------------------------------------------------------------------
+# Text Chunker
+# ---------------------------------------------------------------------------
 
 class TextChunker:
     """Procesador de texto para chunking."""
@@ -219,8 +244,8 @@ class TextChunker:
     def __init__(self):
         settings = get_settings()
         self.splitter = RecursiveCharacterTextSplitter(
-            chunk_size=settings.RAG_CHUNK_SIZE,
-            chunk_overlap=settings.RAG_CHUNK_OVERLAP,
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
             separators=["\n\n", "\n", ". ", " ", ""],
             length_function=len,
         )
@@ -228,7 +253,7 @@ class TextChunker:
     def chunk_text(
         self, 
         text: str, 
-        metadata: Dict[str, Any] = None
+        metadata: Dict[str, Any] = None,
     ) -> List[Document]:
         """Divide texto en chunks."""
         chunks = self.splitter.split_text(text)
@@ -238,18 +263,18 @@ class TextChunker:
             doc_metadata = {
                 "chunk_index": i,
                 "total_chunks": len(chunks),
-                **(metadata or {})
+                **(metadata or {}),
             }
             documents.append(Document(
                 page_content=chunk,
-                metadata=doc_metadata
+                metadata=doc_metadata,
             ))
         
         return documents
     
     def chunk_documents(
         self, 
-        documents: List[Document]
+        documents: List[Document],
     ) -> List[Document]:
         """Divide una lista de documentos en chunks."""
         chunked_docs = []
@@ -258,6 +283,10 @@ class TextChunker:
             chunked_docs.extend(chunks)
         return chunked_docs
 
+
+# ---------------------------------------------------------------------------
+# RAG Engine
+# ---------------------------------------------------------------------------
 
 class RAGEngine:
     """
@@ -276,35 +305,57 @@ class RAGEngine:
         self.vector_store = VectorStore(self.embedding_engine)
         self.text_chunker = TextChunker()
         self.llm_client = None
+        self.llm_provider = None
+        self.llm_model = None
+        self.llm_max_tokens = None
         self._initialize_llm()
     
+    # ---------------------------------------------------------------------
+    # Inicialización LLM
+    # ---------------------------------------------------------------------
     def _initialize_llm(self):
-        """Inicializa el cliente LLM."""
-        if self.settings.LLM_PROVIDER == "anthropic":
-            try:
+        """Inicializa el cliente LLM según la configuración."""
+        llm_config = self.settings.get_llm_config()
+        provider = llm_config.get("provider")
+        
+        if not provider:
+            logger.warning("No LLM provider configured. RAG will run in fallback mode.")
+            return
+        
+        self.llm_provider = provider
+        self.llm_model = llm_config.get("model")
+        self.llm_max_tokens = llm_config.get("max_tokens", 4096)
+        
+        try:
+            if provider == "anthropic":
                 import anthropic
-                self.llm_client = anthropic.Anthropic(
-                    api_key=self.settings.ANTHROPIC_API_KEY
-                )
+                self.llm_client = anthropic.Anthropic(api_key=llm_config["api_key"])
                 logger.info("Anthropic LLM client initialized")
-            except Exception as e:
-                logger.warning(f"Could not initialize Anthropic client: {e}")
-        elif self.settings.LLM_PROVIDER == "openai":
-            try:
+            
+            elif provider == "openai":
                 from openai import OpenAI
-                self.llm_client = OpenAI(
-                    api_key=self.settings.OPENAI_API_KEY
-                )
+                self.llm_client = OpenAI(api_key=llm_config["api_key"])
                 logger.info("OpenAI LLM client initialized")
-            except Exception as e:
-                logger.warning(f"Could not initialize OpenAI client: {e}")
+            
+            elif provider == "google":
+                genai.configure(api_key=llm_config["api_key"])
+                self.llm_client = genai.GenerativeModel(self.llm_model)
+                logger.info("Google Gemini LLM client initialized")
+        
+        except Exception as e:
+            logger.error(f"Error initializing LLM provider '{provider}': {e}")
+            self.llm_client = None
+            self.llm_provider = None
     
+    # ---------------------------------------------------------------------
+    # Ingesta
+    # ---------------------------------------------------------------------
     def ingest_document(
         self, 
         content: str, 
         source_name: str,
         source_type: str = "primary",
-        metadata: Dict[str, Any] = None
+        metadata: Dict[str, Any] = None,
     ) -> int:
         """
         Ingesta un documento al sistema.
@@ -322,35 +373,28 @@ class RAGEngine:
             "source": source_name,
             "source_type": source_type,
             "ingested_at": datetime.utcnow().isoformat(),
-            **(metadata or {})
+            **(metadata or {}),
         }
         
-        # Chunk del documento
         chunks = self.text_chunker.chunk_text(content, doc_metadata)
         
-        # Indexar en vector store
         source_info = {"type": source_type, "name": source_name}
         count = self.vector_store.add_documents(chunks, source_info)
         
         logger.info(f"Ingested document '{source_name}' with {count} chunks")
         return count
     
+    # ---------------------------------------------------------------------
+    # Recuperación
+    # ---------------------------------------------------------------------
     def retrieve(
         self, 
         query: str,
         top_k: int = None,
-        source_types: List[str] = None
+        source_types: List[str] = None,
     ) -> RetrievalResult:
         """
         Recupera documentos relevantes para una consulta.
-        
-        Args:
-            query: Consulta de búsqueda
-            top_k: Número de resultados a retornar
-            source_types: Filtrar por tipos de fuente
-        
-        Returns:
-            RetrievalResult con documentos y metadatos
         """
         import time
         start_time = time.time()
@@ -361,17 +405,16 @@ class RAGEngine:
         
         documents, scores = self.vector_store.search(
             query=query,
-            top_k=top_k or self.settings.RAG_TOP_K,
-            filter_criteria=filter_criteria
+            top_k=top_k or self.settings.rag_top_k,
+            filter_criteria=filter_criteria,
         )
         
-        # Filtrar por umbral de similitud
         filtered_docs = []
         filtered_scores = []
         sources = []
         
         for doc, score in zip(documents, scores):
-            if score >= self.settings.RAG_SIMILARITY_THRESHOLD:
+            if score >= self.settings.rag_similarity_threshold:
                 filtered_docs.append(doc)
                 filtered_scores.append(score)
                 
@@ -379,7 +422,7 @@ class RAGEngine:
                     name=doc.metadata.get("source", "unknown"),
                     source_type=doc.metadata.get("source_type", "primary"),
                     confidence=score,
-                    metadata=doc.metadata
+                    metadata=doc.metadata,
                 ))
         
         retrieval_time = (time.time() - start_time) * 1000
@@ -393,10 +436,13 @@ class RAGEngine:
             metadata={
                 "total_candidates": len(documents),
                 "filtered_count": len(filtered_docs),
-                "threshold": self.settings.RAG_SIMILARITY_THRESHOLD
-            }
+                "threshold": self.settings.rag_similarity_threshold,
+            },
         )
     
+    # ---------------------------------------------------------------------
+    # Construcción de contexto
+    # ---------------------------------------------------------------------
     def _build_context(self, documents: List[Document]) -> str:
         """Construye el contexto a partir de documentos recuperados."""
         context_parts = []
@@ -411,15 +457,17 @@ class RAGEngine:
         
         return "\n---\n".join(context_parts)
     
+    # ---------------------------------------------------------------------
+    # Generación con LLM
+    # ---------------------------------------------------------------------
     def _generate_with_llm(
         self, 
         query: str, 
         context: str,
-        system_prompt: str = None
+        system_prompt: str = None,
     ) -> Tuple[str, List[str]]:
         """
         Genera respuesta usando el LLM.
-        
         Returns:
             Tuple de (respuesta, cadena de razonamiento)
         """
@@ -454,64 +502,67 @@ CONSULTA DEL USUARIO:
 Proporciona una respuesta completa basada ÚNICAMENTE en las fuentes anteriores.
 Cita específicamente qué fuente respalda cada afirmación."""
         
-        if not self.llm_client:
-            # Respuesta de fallback si no hay LLM configurado
+        if not self.llm_client or not self.llm_provider:
             return self._generate_fallback_response(query, context), []
         
         try:
-            if self.settings.LLM_PROVIDER == "anthropic":
+            # Anthropic
+            if self.llm_provider == "anthropic":
                 response = self.llm_client.messages.create(
-                    model=self.settings.LLM_MODEL,
-                    max_tokens=self.settings.LLM_MAX_TOKENS,
-                    temperature=self.settings.LLM_TEMPERATURE,
+                    model=self.llm_model,
+                    max_tokens=self.llm_max_tokens,
+                    temperature=0.2,
                     system=system,
-                    messages=[{"role": "user", "content": user_message}]
+                    messages=[{"role": "user", "content": user_message}],
                 )
                 return response.content[0].text, []
             
-            elif self.settings.LLM_PROVIDER == "openai":
+            # OpenAI
+            if self.llm_provider == "openai":
                 response = self.llm_client.chat.completions.create(
-                    model=self.settings.LLM_MODEL,
+                    model=self.llm_model,
                     messages=[
                         {"role": "system", "content": system},
-                        {"role": "user", "content": user_message}
+                        {"role": "user", "content": user_message},
                     ],
-                    temperature=self.settings.LLM_TEMPERATURE,
-                    max_tokens=self.settings.LLM_MAX_TOKENS
+                    temperature=0.2,
+                    max_tokens=self.llm_max_tokens,
                 )
                 return response.choices[0].message.content, []
-                
+            
+            # Google Gemini
+            if self.llm_provider == "google":
+                prompt = f"System:\n{system}\n\nUser and context:\n{user_message}"
+                response = self.llm_client.generate_content(prompt)
+                return response.text, []
+        
         except Exception as e:
-            logger.error(f"LLM generation error: {e}")
+            logger.error(f"LLM generation error ({self.llm_provider}): {e}")
             return self._generate_fallback_response(query, context), []
     
     def _generate_fallback_response(self, query: str, context: str) -> str:
         """Genera respuesta de fallback cuando no hay LLM."""
-        return f"""**Modo de demostración activo** (LLM no configurado)
-
-Se encontraron {context.count('[Source')} fuentes relevantes para su consulta: "{query}"
-
-Para obtener respuestas completas con análisis de IA:
-1. Configure ANTHROPIC_API_KEY o OPENAI_API_KEY en el archivo .env
-2. Reinicie el servidor
-
-Contexto recuperado (primeros 500 caracteres):
-{context[:500]}..."""
+        num_sources = context.count("[Source")
+        return (
+            f"**Modo de demostración activo** (LLM no configurado o con error)\n\n"
+            f"Se encontraron {num_sources} fuentes relevantes para su consulta: \"{query}\"\n\n"
+            "Para obtener respuestas completas con análisis de IA:\n"
+            "1. Configure ANTHROPIC_API_KEY, OPENAI_API_KEY o GOOGLE_API_KEY en el archivo .env\n"
+            "2. Reinicie el servidor\n\n"
+            "Contexto recuperado (primeros 500 caracteres):\n"
+            f"{context[:500]}..."
+        )
     
+    # ---------------------------------------------------------------------
+    # Pipeline completo
+    # ---------------------------------------------------------------------
     def query(
         self, 
         query: str,
-        include_verification: bool = True
+        include_verification: bool = True,
     ) -> GenerationResult:
         """
         Ejecuta el pipeline RAG completo.
-        
-        Args:
-            query: Pregunta del usuario
-            include_verification: Si incluir verificación de respuesta
-        
-        Returns:
-            GenerationResult con respuesta y metadatos
         """
         # 1. Recuperación
         retrieval = self.retrieve(query)
@@ -521,9 +572,9 @@ Contexto recuperado (primeros 500 caracteres):
                 answer="No se encontró información relevante en las fuentes disponibles para responder esta consulta.",
                 sources=[],
                 confidence_score=0.0,
-                verification_status=Constants.VERIFICATION_STATUS["FAILED"],
+                verification_status=VERIFICATION_STATUS["FAILED"],
                 query=query,
-                metadata={"reason": "no_relevant_documents"}
+                metadata={"reason": "no_relevant_documents"},
             )
         
         # 2. Construcción de contexto
@@ -537,14 +588,14 @@ Contexto recuperado (primeros 500 caracteres):
         source_diversity = len(set(s.source_type for s in retrieval.sources)) / 4  # Max 4 types
         confidence = (avg_relevance * 0.6 + source_diversity * 0.4)
         
-        # 5. Verificación (si está habilitada)
-        verification_status = Constants.VERIFICATION_STATUS["VERIFIED"]
+        # 5. Verificación
+        verification_status = VERIFICATION_STATUS["VERIFIED"]
         if include_verification:
-            if len(retrieval.sources) < self.settings.VERIFICATION_MIN_SOURCES:
-                verification_status = Constants.VERIFICATION_STATUS["PENDING"]
+            if len(retrieval.sources) < self.settings.verification_min_sources:
+                verification_status = VERIFICATION_STATUS["PENDING"]
                 confidence *= 0.8
-            elif confidence < self.settings.VERIFICATION_CONFIDENCE_THRESHOLD:
-                verification_status = Constants.VERIFICATION_STATUS["CROSS_CHECKING"]
+            elif confidence < self.settings.verification_confidence_threshold:
+                verification_status = VERIFICATION_STATUS["CROSS_CHECKING"]
         
         return GenerationResult(
             answer=answer,
@@ -558,12 +609,13 @@ Contexto recuperado (primeros 500 caracteres):
                 "documents_used": len(retrieval.documents),
                 "avg_relevance": round(avg_relevance, 4),
                 "source_diversity": round(source_diversity, 4),
-            }
+            },
         )
 
 
 # Singleton instance
 _rag_engine: Optional[RAGEngine] = None
+
 
 def get_rag_engine() -> RAGEngine:
     """Obtiene la instancia singleton del RAG Engine."""

@@ -32,11 +32,12 @@ class Settings(BaseSettings):
     
     openai_api_key: Optional[str] = Field(default=None, description="OpenAI API key")
     openai_model: str = Field(default="gpt-4-turbo-preview", description="OpenAI model")
+
+    google_api_key: Optional[str] = Field(default=None, description="Google API key (Gemini)")
     
     # ============================================
-    # GOOGLE APIS
+    # GOOGLE SEARCH / CLOUD
     # ============================================
-    google_api_key: Optional[str] = Field(default=None, description="Google API key")
     google_search_engine_id: Optional[str] = Field(default=None, description="Google Custom Search Engine ID")
     google_cloud_project: Optional[str] = Field(default=None, description="Google Cloud Project ID")
     google_search_enabled: bool = Field(default=True, description="Enable Google Search")
@@ -134,45 +135,71 @@ class Settings(BaseSettings):
     feature_competitive_intel: bool = Field(default=True, description="Enable Competitive Intelligence")
     feature_predictive: bool = Field(default=True, description="Enable Predictive Intelligence")
     feature_weak_signals: bool = Field(default=True, description="Enable Weak Signal Detection")
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-        case_sensitive = False
-    
+
+
+    # ============================================================
+    # LLM HELPERS (CORREGIDOS)
+    # ============================================================
+
     @property
     def has_llm_provider(self) -> bool:
-        return bool(self.anthropic_api_key or self.openai_api_key)
-    
-    @property
-    def has_google_search(self) -> bool:
-        return bool(self.google_api_key and self.google_search_engine_id)
-    
-    @property
-    def has_finnhub(self) -> bool:
-        return bool(self.finnhub_api_key)
-    
-    @property
-    def is_production(self) -> bool:
-        return self.environment == "production"
-    
+        """Indica si existe al menos un proveedor LLM disponible."""
+        return bool(
+            self.anthropic_api_key or
+            self.openai_api_key or
+            self.google_api_key
+        )
+
     def get_llm_config(self) -> dict:
+        """
+        Devuelve el proveedor LLM activo en este orden de prioridad:
+        1. Anthropic
+        2. OpenAI
+        3. Google Gemini
+        """
         if self.anthropic_api_key:
             return {
                 "provider": "anthropic",
                 "api_key": self.anthropic_api_key,
                 "model": self.anthropic_model,
-                "max_tokens": self.anthropic_max_tokens
+                "max_tokens": self.anthropic_max_tokens,
             }
-        elif self.openai_api_key:
+
+        if self.openai_api_key:
             return {
                 "provider": "openai",
                 "api_key": self.openai_api_key,
                 "model": self.openai_model,
-                "max_tokens": 4096
+                "max_tokens": 4096,
             }
+
+        if self.google_api_key:
+            return {
+                "provider": "google",
+                "api_key": self.google_api_key,
+                "model": "gemini-1.5-flash",  # puedes personalizar aquí
+                "max_tokens": 8192,
+            }
+
         return {"provider": None}
-    
+
+
+    # ============================================================
+    # OTHER HELPERS
+    # ============================================================
+
+    @property
+    def has_google_search(self) -> bool:
+        return bool(self.google_api_key and self.google_search_engine_id)
+
+    @property
+    def has_finnhub(self) -> bool:
+        return bool(self.finnhub_api_key)
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
     def get_enabled_features(self) -> List[str]:
         features = []
         if self.feature_due_diligence:
@@ -186,6 +213,12 @@ class Settings(BaseSettings):
         return features
 
 
+class Config:
+    env_file = ".env"
+    env_file_encoding = "utf-8"
+    case_sensitive = False
+
+
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()
@@ -197,24 +230,25 @@ def get_api_status() -> dict:
         "llm": {
             "anthropic": bool(settings.anthropic_api_key),
             "openai": bool(settings.openai_api_key),
-            "primary": settings.get_llm_config()["provider"]
+            "google": bool(settings.google_api_key),
+            "primary": settings.get_llm_config()["provider"],
         },
         "google": {
             "search": settings.has_google_search,
-            "vertex_ai": settings.vertex_ai_enabled
+            "vertex_ai": settings.vertex_ai_enabled,
         },
         "financial": {
             "finnhub": settings.has_finnhub,
             "alpha_vantage": bool(settings.alpha_vantage_api_key),
-            "yahoo_finance": settings.yahoo_finance_enabled
+            "yahoo_finance": settings.yahoo_finance_enabled,
         },
         "news": {
             "newsapi": bool(settings.news_api_key),
-            "newsdata": bool(settings.newsdata_api_key)
+            "newsdata": bool(settings.newsdata_api_key),
         },
         "compliance": {
             "opensanctions": settings.opensanctions_enabled,
-            "ofac": settings.ofac_enabled
+            "ofac": settings.ofac_enabled,
         },
-        "features": settings.get_enabled_features()
+        "features": settings.get_enabled_features(),
     }
